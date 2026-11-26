@@ -982,6 +982,27 @@ def run_ad_loop() -> int:
 
 
 
+def auto_enter_first_ad() -> bool:
+    """
+    启动后自动进入第一个广告：
+      1) 先清一遍续费会员弹窗
+      2) 找「立即解锁 / 立即领取」弹窗按钮，其次找右上角「免」字
+    都没找到返回 False，交给用户手动点。
+    """
+    log("阶段三B：尝试自动进入第一个广告")
+    try:
+        dismiss_popups(max_rounds=2)
+    except Exception as e:
+        log(f"  预清理弹窗异常: {e}")
+    ok = wait_for_mian_button(timeout=25, allow_mian=True)
+    if ok:
+        log("  ✅ 已自动进入广告，脚本接管后续轮次")
+        human_sleep(2)
+    else:
+        log("  ⚠️ 未自动找到进广告入口，请手动点右上角'免'字或'立即解锁'弹窗")
+    return ok
+
+
 def main():
     """脚本入口主函数"""
     log("🎵 汽水音乐自动看广告脚本（Android 版）启动")
@@ -997,7 +1018,9 @@ def main():
             return
         # 3. 跳开屏广告
         skip_splash_ad(timeout=5)
-        # 4. 核心循环（用户手动进广告后自动接管）
+        # 3.5 自动进入第一个广告（失败则等用户手动进）
+        auto_enter_first_ad()
+        # 4. 核心循环（进入广告后自动接管）
         total = run_ad_loop()
         # 5. 结束
         state = roll_daily(load_state())
