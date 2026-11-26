@@ -116,9 +116,34 @@ run_project(...)
 | `ENABLE_SELECTOR_FALLBACK` | `True` | 是否允许 Selector 控件检索兜底 |
 | `SELECTOR_MODE` | `2` | Selector 检索模式（accessibility 默认 2，拿不到试 3 / 0 / 1） |
 | `MAX_IDLE_ROUNDS` | `10` | 连续多少轮没领到奖励后自动退出 |
-| `DAILY_MAX_CLAIMS` | `30` | 当日领取次数上限保护 |
+| `DAILY_MAX_CLAIMS` | `30` | 单日领取次数上限保护 |
+| `TARGET_MODE` | `"today"` | 目标达成即停模式：`"today"` 今日畅听 / `"days"` 累计天数 / `"minutes"` 累计时长 |
+| `TARGET_DAYS` | `15` | `TARGET_MODE="days"` 时的累计目标天数（半月 15、整月 30） |
+| `TARGET_MINUTES` | `600` | `TARGET_MODE="minutes"` 时的累计目标分钟数 |
+| `DAILY_CLAIM_TARGET` | `4` | 满多少次折算 1 天畅听（2026-11 起官方为 4 次） |
+| `CONTINUE_PRECLAIM` | `True` | 今日达成后是否继续「提前领明日畅听」 |
+| `MAX_CLAIMS_PER_RUN` | `12` | 单次运行最多领取次数，防止一口气刷太多 |
 | `TAP_JITTER_PX` | `3` | 点击坐标随机偏移像素范围（±） |
 | `POLL_MIN` / `POLL_MAX` | `0.2` / `0.5` | 轮询间隔随机区间（秒） |
+
+## 目标达成即停：日 / 半月 / 整月怎么配
+
+平台权益本身可累加（看广告兑换的畅听时长能叠加），但**每天能领的次数有上限**，所以"半个月""一个月"不可能一次跑完，只能**每天跑一次、跨天累计**。
+
+| 想要的周期 | 配置 | 运行方式 |
+| --- | --- | --- |
+| 只要今天能听 | `TARGET_MODE="today"`，`CONTINUE_PRECLAIM=False` | 跑一次即可，满 4 次自动停 |
+| 今天 + 提前攒明天 | `TARGET_MODE="today"`，`CONTINUE_PRECLAIM=True` | 跑一次，今日达成后继续点「提前领明日畅听」 |
+| 半个月 | `TARGET_MODE="days"`，`TARGET_DAYS=15` | 每天跑一次，累计到 15 天自动停 |
+| 一个月 | `TARGET_MODE="days"`，`TARGET_DAYS=30` | 每天跑一次，累计到 30 天自动停 |
+| 按分钟累积 | `TARGET_MODE="minutes"`，`TARGET_MINUTES=600` | 依赖 App 内「免费听时长」可被 OCR 读到 |
+
+跨天进度用 `KeyValue`（键 `qishui_progress`）持久化，记录 `date / claims_today / total_days / total_minutes`，**App 重启不丢**；跨天会自动把当日计数归零，累计天数保留。
+
+想让"每天自动跑一次"，在 AScript 客户端里配**定时任务**（云控计划任务）即可，不要在单次运行里靠长时间挂机凑天数——那反而增加风控暴露面。
+
+> 注意：App 里能否「提前领明日」、能提前领几天，由平台规则决定。若按钮不存在，`CONTINUE_PRECLAIM` 下的循环会因为找不到入口而按 `MAX_IDLE_ROUNDS` 正常退出，不会空转太久。
+
 
 ## 稳妥 / 低介入策略说明
 

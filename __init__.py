@@ -31,6 +31,7 @@
 """
 
 import os
+import json
 import time
 import random
 import traceback
@@ -40,6 +41,14 @@ from ascript.android import action  # type: ignore
 from ascript.android import system  # type: ignore
 from ascript.android.system import R, Device  # type: ignore
 from ascript.android.screen import Ocr, FindImages  # type: ignore
+
+# 跨天累计进度需要持久化（App 重启不丢），部分版本可能无此模块，做兜底
+try:
+    from ascript.android.system import KeyValue  # type: ignore
+    _KV_AVAILABLE = True
+except Exception:
+    KeyValue = None  # type: ignore
+    _KV_AVAILABLE = False
 
 # Selector 仅在有控件树的模式（accessibility / root / hid）下可用；
 # screen_only 模式下导入或检索可能失败，这里单独兜底，不影响主流程。
@@ -61,7 +70,24 @@ APP_PACKAGE = "com.luna.music"
 MAX_LOOP_COUNT = 50          # 最大循环次数（防止无限跑）
 LOOP_INTERVAL = 3            # 每次主循环间隔（秒）
 MAX_IDLE_ROUNDS = 10        # 连续多少轮没领到奖励后自动退出（判断当日额度用完）
-DAILY_MAX_CLAIMS = 30       # 当日领取次数上限保护（达到即停，避免长时间高频运行）
+DAILY_MAX_CLAIMS = 30       # 单日领取次数上限保护（达到即停，避免长时间高频运行）
+
+# ========== 目标达成即停 ==========
+# TARGET_MODE 三种模式：
+#   "today"   —— 解锁「今日畅听」即停（默认，最省事）
+#   "days"    —— 累计畅听天数达到 TARGET_DAYS 天（半月=15，整月=30）；每天跑一次累计
+#   "minutes" —— 累计「免费听时长」达到 TARGET_MINUTES 分钟（需 App 内能读到该数值）
+TARGET_MODE = "today"
+TARGET_DAYS = 15          # TARGET_MODE="days" 时生效：累计目标天数
+TARGET_MINUTES = 600      # TARGET_MODE="minutes" 时生效：累计目标分钟数
+
+# 单次运行的单日领取规划（2026-11 起「今日畅听」需看满 4 次广告）
+DAILY_CLAIM_TARGET = 4    # 满这么多次视为解锁 1 天畅听
+CONTINUE_PRECLAIM = True  # 今日达成后，是否继续点「提前领明日畅听」多攒天数
+MAX_CLAIMS_PER_RUN = 12   # 单次运行最多领取次数（含提前领），防止一口气刷太多
+
+# 进度持久化
+STATE_KEY = "qishui_progress"   # KeyValue 键名，记录跨天累计进度
 
 # OCR 引擎：Android 可选 "paddle"（PP-OCR V5，高精度多语言）/ "mlkit"（谷歌 ML Kit，快）
 OCR_ENGINE = "paddle"
@@ -774,30 +800,145 @@ def claim_reward() -> int:
     return 1
 
 
+# ============== 跨天进度（目标达成即停的基础） ==============
+
+def today_str() -> str:
+    return time.strftime("%Y-%m-%d", time.localtime())
+
+
+def load_state() -> dict:
+    """读取跨天累计进度；读取失败按空进度处理，不阻断主流程"""
+    if not _KV_AVAILABLE:
+        log("  ⚠️  KeyValue 不可用，跨天进度只在本机内存中有效（重启后清零）")
+        return {}
+    try:
+        raw = KeyValue.get(STATE_KEY, "")
+        if not raw:
+            return {}
+        return json.loads(raw) if isinstance(raw, str) else {}
+    except Exception as e:
+        log(f"  进度读取异常: {e}")
+        return {}
+
+
+def save_state(state: dict):
+    if not _KV_AVAILABLE:
+        return
+    try:
+        KeyValue.save(STATE_KEY, json.dumps(state, ensure_ascii=False))
+    except Exception as e:
+        log(f"  进度保存异常: {e}")
+
+
+def roll_daily(state: dict) -> dict:
+    """跨天自动归零当日计数"""
+    d = today_str()
+    if state.get("date") != d:
+        state["date"] = d
+        state["claims_today"] = 0
+        state["days_counted_today"] = 0
+    state.setdefault("claims_today", 0)
+    state.setdefault("days_counted_today", 0)
+    state.setdefault("total_days", 0)
+    state.setdefault("total_minutes", 0)
+    return state
+
+
+def count_days_from_claims(state: dict):
+    """
+    按领取次数折算累计天数：每满 DAILY_CLAIM_TARGET 次折算 1 天
+    （「今日畅听」1 天 + 后续「提前领明日畅听」各折算 1 天）
+    """
+    per = max(1, DAILY_CLAIM_TARGET)
+    counted = state.get("claims_today", 0) // per
+    delta = counted - state.get("days_counted_today", 0)
+    if delta > 0:
+        state["days_counted_today"] = counted
+        state["total_days"] = state.get("total_days", 0) + delta
+        log(f"  📅 累计畅听天数 +{delta} → {state['total_days']} 天")
+
+
+def read_free_minutes():
+    """尝试读取 App 内的「免费听时长」数值（分钟）；读不到返回 None"""
+    w, h = screen_size()
+    rect = [0, int(h * 0.06), w, int(h * 0.34)]
+    try:
+        results = Ocr.paddleocr(rect=rect, pattern=r"(免费听时长|听时长|时长)")
+        if results and isinstance(results, list):
+            for item in results:
+                digits = "".join(ch for ch in item.get("text", "") if ch.isdigit())
+                if digits:
+                    return int(digits)
+    except Exception:
+        pass
+    return None
+
+
+def target_reached(state: dict, success_count: int) -> tuple:
+    """返回 (是否达成目标, 说明)"""
+    if TARGET_MODE == "days":
+        if state.get("total_days", 0) >= TARGET_DAYS:
+            return True, f"累计畅听已达 {state.get('total_days', 0)}/{TARGET_DAYS} 天，目标完成"
+        return False, ""
+    if TARGET_MODE == "minutes":
+        if state.get("total_minutes", 0) >= TARGET_MINUTES:
+            return True, f"累计时长已达 {state.get('total_minutes', 0)}/{TARGET_MINUTES} 分钟，目标完成"
+        return False, ""
+    # "today"：今日畅听解锁（按次数判定），且不再继续提前领
+    if not CONTINUE_PRECLAIM and success_count >= DAILY_CLAIM_TARGET:
+        return True, f"今日畅听已解锁（本次领取 {success_count} 次），目标完成"
+    return False, ""
+
+
+def print_progress(state: dict, success_count: int):
+    log("=" * 60)
+    log(f"📊 本次领取 {success_count} 次 | 今日累计 {state.get('claims_today', 0)} 次")
+    if TARGET_MODE == "days":
+        log(f"📅 累计畅听 {state.get('total_days', 0)}/{TARGET_DAYS} 天"
+            f"（还差 {max(0, TARGET_DAYS - state.get('total_days', 0))} 天）")
+    elif TARGET_MODE == "minutes":
+        log(f"⏱ 累计时长 {state.get('total_minutes', 0)}/{TARGET_MINUTES} 分钟")
+    else:
+        log("🎯 目标模式：今日畅听")
+
+
 # ============== 主流程 ==============
 
 def run_ad_loop() -> int:
     """
     核心循环：用户手动进入广告后，脚本负责
       等广告倒计时结束 → 点“领取成功” → 点“领取奖励” → 自动进入下一轮广告 → 循环
-    每次成功领取计 1 次，累计到 success_count。
-    返回累计成功次数（失败时也返回已拿到的次数）。
+    每次成功领取计 1 次，累计到 success_count；达成 TARGET_MODE 指定目标即停。
+    返回本次运行累计成功次数。
     """
     log("\n" + "#" * 60)
-    log("🎯 进入核心广告领取循环（按停止项目即可退出）")
+    log(f"🎯 进入核心广告领取循环（TARGET_MODE={TARGET_MODE}，达成即停）")
     log("#" * 60)
     log("   ⚠️  请在 App 上手动进入一个广告（点右上角'免'字或'立即解锁'弹窗），脚本会自动接管后续轮次")
     success_count = 0
     round_idx = 0
     idle_count = 0
 
+    state = roll_daily(load_state())
+    print_progress(state, 0)
+
     while True:
         round_idx += 1
         log(f"\n---- 第 {round_idx} 轮广告循环 ----")
 
-        # 当日领取上限保护
-        if success_count >= DAILY_MAX_CLAIMS:
-            log(f"  ⚠️  已达当日领取上限 {DAILY_MAX_CLAIMS} 次，自动停止")
+        # 目标达成判断（每轮开头都查一次）
+        reached, reason = target_reached(state, success_count)
+        if reached:
+            log(f"  🎯 {reason}，自动停止")
+            break
+
+        # 单次运行领取次数保护
+        if success_count >= MAX_CLAIMS_PER_RUN:
+            log(f"  ⚠️  本次运行已达上限 {MAX_CLAIMS_PER_RUN} 次，停止（避免一口气刷太多）")
+            break
+        # 单日总次数保护
+        if state.get("claims_today", 0) >= DAILY_MAX_CLAIMS:
+            log(f"  ⚠️  今日累计已达上限 {DAILY_MAX_CLAIMS} 次，停止")
             break
 
         # 步骤 1：等广告倒计时结束（30s 超时）
@@ -816,7 +957,10 @@ def run_ad_loop() -> int:
         if claim_res == 1:
             success_count += 1
             idle_count = 0
-            log(f"  ✅ 第 {round_idx} 轮领取成功！累计成功次数 = {success_count}")
+            state["claims_today"] = state.get("claims_today", 0) + 1
+            count_days_from_claims(state)
+            save_state(state)
+            log(f"  ✅ 第 {round_idx} 轮领取成功！本次累计 = {success_count}，今日累计 = {state['claims_today']}")
         else:
             idle_count += 1
             log(f"  ⚠️  第 {round_idx} 轮领取失败（连续 {idle_count}/{MAX_IDLE_ROUNDS} 轮领取失败）")
@@ -827,13 +971,22 @@ def run_ad_loop() -> int:
         # 每轮结束后短暂休息，避免过快
         human_sleep(1)
 
+    # 收尾：读一次「免费听时长」并入账（读不到不影响流程）
+    minutes = read_free_minutes()
+    if minutes is not None:
+        state["total_minutes"] = max(state.get("total_minutes", 0), minutes)
+        save_state(state)
+        log(f"  ⏱ 读到「免费听时长」≈ {minutes} 分钟")
+    print_progress(state, success_count)
     return success_count
+
 
 
 def main():
     """脚本入口主函数"""
     log("🎵 汽水音乐自动看广告脚本（Android 版）启动")
-    log("   核心功能：跳过开屏广告 → 等待用户手动进广告 → 循环领奖励")
+    log("   核心功能：跳过开屏广告 → 等待用户手动进广告 → 循环领奖励 → 达成目标即停")
+    log_target_plan()
     try:
         # 1. 初始化
         init_regions()
@@ -847,14 +1000,34 @@ def main():
         # 4. 核心循环（用户手动进广告后自动接管）
         total = run_ad_loop()
         # 5. 结束
+        state = roll_daily(load_state())
         log("=" * 60)
-        log(f"✅ 脚本运行结束，共成功领取 {total} 次奖励")
-        notify_safe(f"汽水音乐 Android 版完成，成功 {total} 次")
+        log(f"✅ 脚本运行结束，本次成功领取 {total} 次")
+        if TARGET_MODE == "days" and state.get("total_days", 0) < TARGET_DAYS:
+            left = TARGET_DAYS - state.get("total_days", 0)
+            log(f"📅 还需 {left} 天达成目标，明天再跑一次（建议配定时任务每日自动执行）")
+            notify_safe(f"汽水音乐：今日完成，累计 {state.get('total_days', 0)}/{TARGET_DAYS} 天")
+        else:
+            notify_safe(f"汽水音乐 Android 版完成，成功 {total} 次")
     except Exception as e:
         log(f"❌ 脚本主流程异常: {e}")
         traceback.print_exc()
     finally:
         log("脚本退出")
+
+
+def log_target_plan():
+    if TARGET_MODE == "days":
+        st = roll_daily(load_state())
+        log(f"🎯 目标：累计畅听 {TARGET_DAYS} 天（当前 {st.get('total_days', 0)} 天）"
+            f"；每日领满 {DAILY_CLAIM_TARGET} 次折算 1 天")
+    elif TARGET_MODE == "minutes":
+        st = roll_daily(load_state())
+        log(f"🎯 目标：累计免费听时长 {TARGET_MINUTES} 分钟（当前 {st.get('total_minutes', 0)} 分钟）")
+    else:
+        log(f"🎯 目标：解锁今日畅听（约 {DAILY_CLAIM_TARGET} 次广告）"
+            f"{'，并继续提前领明日畅听' if CONTINUE_PRECLAIM else ''}")
+
 
 
 # ============== 入口：AScript 工程约定顶层直接执行 ==============
